@@ -16,7 +16,7 @@ export const openCodeTransforms: Transform[] = [
       const blockedTools = BLOCKED_BUILTIN_TOOLS
       const incompatibleTools = CLAUDE_CODE_ONLY_TOOLS
       const allowedMcpTools = ALLOWED_MCP_TOOLS
-      const coreToolNames: readonly string[] = ["read", "write", "edit", "bash", "glob", "grep"]
+      const coreToolNames: readonly string[] = ["read", "write", "edit", "bash", "glob", "grep", "task"]
 
       // Passthrough mode (env var, default true)
       const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
