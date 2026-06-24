@@ -1390,6 +1390,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             }
           }
 
+          // Deduplicate tool_use blocks by id (non-streaming path).
+          // The SDK can emit the same tool_use in multiple turns; without
+          // dedup the client sees duplicate blocks and executes the tool
+          // twice. Keep the first occurrence to preserve order. (#528)
+          if (passthrough) {
+            const seenToolUseIds = new Set<string>()
+            const dedupedBlocks: typeof contentBlocks = []
+            for (const block of contentBlocks) {
+              if (block.type === "tool_use") {
+                const id = (block as any).id as string | undefined
+                if (id && seenToolUseIds.has(id)) {
+                  claudeLog("passthrough.tool_use_deduped", { mode: "non_stream", id })
+                  continue
+                }
+                if (id) seenToolUseIds.add(id)
+              }
+              dedupedBlocks.push(block)
+            }
+            contentBlocks.length = 0
+            contentBlocks.push(...dedupedBlocks)
+          }
+
           // Determine stop_reason: use content-based heuristic for standard cases,
           // but preserve non-standard upstream values like pause_turn (advisor flows)
           const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
@@ -1565,6 +1587,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // dedupe captured tool_uses against what was already forwarded
             // when recovering gracefully from max_turns (see catch below).
             const streamedToolUseIds = new Set<string>()
+            // Hoisted so the max_turns recovery path in the catch block can
+            // emit synthetic tool_use blocks with consistent indices.
+            let nextClientBlockIndex = 0
 
             try {
               let currentSessionId: string | undefined
@@ -1740,8 +1765,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                     }
 
-                    throw error
-                  }
+                  throw error
+                }
                 }
               })()
 
@@ -1776,7 +1801,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // Block index remapping: the SDK resets indices on each turn, but
               // we skip intermediate message_start/stop so the client sees one
               // message. Without remapping, turn 2's index=0 collides with turn 1's.
-              let nextClientBlockIndex = 0
               const sdkToClientIndex = new Map<number, number>()
 
               try {

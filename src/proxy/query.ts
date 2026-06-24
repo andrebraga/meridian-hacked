@@ -111,6 +111,8 @@ export interface QueryContext {
   additionalDirectories?: string[]
   /** Advisor model for server-side advisor tool support */
   advisorModel?: string
+  /** Override the computed maxTurns (used by retry logic after max_turns errors) */
+  maxTurnsOverride?: number
 }
 
 /**
@@ -145,11 +147,21 @@ function computePassthroughMaxTurns(
   resumeSessionId: string | undefined,
   hasDeferredTools: boolean,
   advisorModel: string | undefined,
+  thinking: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" } | undefined,
 ): number {
+  // Env override for operators who know their workload needs more turns.
+  const envOverride = process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS
+  if (envOverride) {
+    const parsed = parseInt(envOverride, 10)
+    if (!isNaN(parsed) && parsed > 0) return parsed
+  }
+
   const hasResume = !!resumeSessionId
   const base = hasResume && hasDeferredTools ? 4 : 3
   const advisorBump = advisorModel ? 3 : 0
-  return base + advisorBump
+  // Extended thinking consumes an extra SDK turn for the thinking block itself.
+  const thinkingBump = thinking && thinking.type !== "disabled" ? 1 : 0
+  return base + advisorBump + thinkingBump
 }
 
 /**
@@ -231,9 +243,9 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       // Hosts like OpenCode embed Bun, so the check fires even when `bun`
       // is not in PATH — causing subprocess spawns to fail.
       executable: "node" as const,
-      maxTurns: passthrough
-        ? computePassthroughMaxTurns(resumeSessionId, hasDeferredTools, ctx.advisorModel)
-        : 200,
+      maxTurns: ctx.maxTurnsOverride ?? (passthrough
+        ? computePassthroughMaxTurns(resumeSessionId, hasDeferredTools, ctx.advisorModel, thinking)
+        : 200),
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
