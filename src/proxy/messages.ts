@@ -15,9 +15,34 @@ function stripCacheControlForHashing(obj: any): any {
 }
 
 /**
+ * Stable JSON serialization for hashing purposes.
+ *
+ * Recursively serializes a value with object keys sorted lexicographically so
+ * the output is byte-identical regardless of the original property order.
+ * Without this, a `tool_use` block whose `input` has its keys in a different
+ * order between requests would hash differently, breaking lineage verification
+ * (issue: "changes out of sync" mid-task — Meridian would classify the
+ * continuation as `diverged` and start a fresh SDK session, losing context).
+ */
+function stableStringify(value: any): string {
+  if (value === null || value === undefined) return JSON.stringify(value)
+  if (typeof value !== "object") return JSON.stringify(value)
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`
+  }
+  const keys = Object.keys(value).sort()
+  const parts: string[] = []
+  for (const k of keys) {
+    parts.push(`${JSON.stringify(k)}:${stableStringify(value[k])}`)
+  }
+  return `{${parts.join(",")}}`
+}
+
+/**
  * Normalize message content to a string for hashing and comparison.
  * Handles both string content and array content (Anthropic content blocks).
- * Strips cache_control metadata to ensure hash stability across requests.
+ * Strips cache_control metadata and uses stable JSON serialization to
+ * ensure hash stability across requests even when clients reorder object keys.
  *
  * NOTE: OpenCode sends content as a string on the first request but as
  * an array on subsequent ones. This normalizer handles both formats.
@@ -28,15 +53,17 @@ export function normalizeContent(content: any): string {
   if (Array.isArray(content)) {
     return content.map((block: any) => {
       if (block.type === "text" && block.text) return block.text
-      if (block.type === "tool_use") return `tool_use:${block.id}:${block.name}:${JSON.stringify(block.input)}`
+      if (block.type === "tool_use") {
+        return `tool_use:${block.id}:${block.name}:${stableStringify(block.input)}`
+      }
       if (block.type === "tool_result") {
         const inner = block.content
         if (typeof inner === "string") return `tool_result:${block.tool_use_id}:${inner}`
         // Strip cache_control from nested content blocks before serializing
-        return `tool_result:${block.tool_use_id}:${JSON.stringify(stripCacheControlForHashing(inner))}`
+        return `tool_result:${block.tool_use_id}:${stableStringify(stripCacheControlForHashing(inner))}`
       }
       // Unknown block types: strip cache_control before serializing
-      return JSON.stringify(stripCacheControlForHashing(block))
+      return stableStringify(stripCacheControlForHashing(block))
     }).join("\n")
   }
   return String(content)

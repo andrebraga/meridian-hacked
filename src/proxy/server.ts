@@ -96,6 +96,59 @@ const exec = promisify(execCallback)
 
 let claudeExecutable = ""
 
+/**
+ * Maximum bytes per `input_json_delta` chunk emitted in passthrough mode.
+ *
+ * Anthropic's reference streaming clients emit deltas in the ~1-2 KB range,
+ * and several downstream parsers (including some SSE middleboxes) truncate
+ * or coalesce frames that exceed their line buffer. The Anthropic spec
+ * permits any chunk size — partial_json values are concatenated by the
+ * client — so we chunk defensively to stay well under common buffer limits
+ * while not fragmenting tiny inputs unnecessarily.
+ *
+ * Set to 0 to disable chunking (emit the whole input as one delta, the
+ * pre-fix behaviour).
+ */
+const PASSTHROUGH_INPUT_DELTA_MAX_BYTES = (() => {
+  const raw = process.env.MERIDIAN_PASSTHROUGH_INPUT_DELTA_MAX_BYTES
+  const parsed = raw === undefined ? 1024 : Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1024
+})()
+
+/**
+ * Split a serialized JSON string into chunks for SSE `input_json_delta`
+ * emission. Tries not to split mid-token (between structural characters) so
+ * the concatenated result is byte-identical to the input.
+ */
+function chunkInputJson(serialized: string): string[] {
+  if (PASSTHROUGH_INPUT_DELTA_MAX_BYTES <= 0) return [serialized]
+  if (serialized.length <= PASSTHROUGH_INPUT_DELTA_MAX_BYTES) return [serialized]
+
+  const chunks: string[] = []
+  let i = 0
+  const max = PASSTHROUGH_INPUT_DELTA_MAX_BYTES
+  while (i < serialized.length) {
+    let end = Math.min(i + max, serialized.length)
+    // Prefer to break on a structural boundary (",", ":", "}", "]", "{", "[")
+    // within the last 32 chars so we don't split inside a string literal.
+    if (end < serialized.length) {
+      const lookback = Math.min(32, end - i)
+      let boundary = -1
+      for (let j = end; j > end - lookback; j--) {
+        const c = serialized[j - 1]
+        if (c === "," || c === ":" || c === "}" || c === "]" || c === "{" || c === "[") {
+          boundary = j
+          break
+        }
+      }
+      if (boundary > i) end = boundary
+    }
+    chunks.push(serialized.slice(i, end))
+    i = end
+  }
+  return chunks
+}
+
 function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | undefined {
   if (profile.type !== "claude-max") return undefined
   return createPlatformCredentialStore(
@@ -1979,11 +2032,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               if (!streamClosed) {
                 // In passthrough mode, emit captured tool_use blocks as stream events
                 // Skip any that were already forwarded during the stream (dedup by ID)
+                //
+                // NOTE: previously used `eventsForwarded + i` for the block index,
+                // but `eventsForwarded` counts ALL events (including deltas/stops/
+                // message_start/stop/ping), while `nextClientBlockIndex` counts only
+                // content blocks. For a response with 2 tool_uses and 2 deltas each
+                // the offset was off by ~10 — clients receiving index 10+ when they
+                // expected index 2+ would silently drop the synthetic blocks. Use
+                // the block counter so indices match what the SDK emitted upstream.
                 const unseenToolUses = capturedToolUses.filter(tu => !streamedToolUseIds.has(tu.id))
                 if (passthrough && unseenToolUses.length > 0 && messageStartEmitted) {
                   for (let i = 0; i < unseenToolUses.length; i++) {
                     const tu = unseenToolUses[i]!
-                    const blockIndex = eventsForwarded + i
+                    const blockIndex = nextClientBlockIndex++
 
                     // content_block_start
                     safeEnqueue(encoder.encode(
@@ -1994,14 +2055,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       })}\n\n`
                     ), "passthrough_tool_block_start")
 
-                    // input_json_delta with the full input
-                    safeEnqueue(encoder.encode(
-                      `event: content_block_delta\ndata: ${JSON.stringify({
-                        type: "content_block_delta",
-                        index: blockIndex,
-                        delta: { type: "input_json_delta", partial_json: JSON.stringify(tu.input) }
-                      })}\n\n`
-                    ), "passthrough_tool_input")
+                    // input_json_delta — chunked for clients with frame size limits
+                    for (const chunk of chunkInputJson(JSON.stringify(tu.input))) {
+                      safeEnqueue(encoder.encode(
+                        `event: content_block_delta\ndata: ${JSON.stringify({
+                          type: "content_block_delta",
+                          index: blockIndex,
+                          delta: { type: "input_json_delta", partial_json: chunk }
+                        })}\n\n`
+                      ), "passthrough_tool_input")
+                    }
 
                     // content_block_stop
                     safeEnqueue(encoder.encode(
@@ -2211,10 +2274,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Mirror the success-path emission: send any unseen tool_uses
                 // (dedup against streamedToolUseIds), then a clean
                 // message_delta with stop_reason="tool_use" + message_stop.
+                //
+                // Uses `nextClientBlockIndex` for the same reason as the
+                // success path above (eventsForwarded is not a block index).
                 const unseenToolUses = capturedToolUses.filter(tu => !streamedToolUseIds.has(tu.id))
                 for (let i = 0; i < unseenToolUses.length; i++) {
                   const tu = unseenToolUses[i]!
-                  const blockIndex = eventsForwarded + i
+                  const blockIndex = nextClientBlockIndex++
                   safeEnqueue(encoder.encode(
                     `event: content_block_start\ndata: ${JSON.stringify({
                       type: "content_block_start",
@@ -2222,13 +2288,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       content_block: { type: "tool_use", id: tu.id, name: tu.name, input: {} }
                     })}\n\n`
                   ), "recover_tool_block_start")
-                  safeEnqueue(encoder.encode(
-                    `event: content_block_delta\ndata: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: blockIndex,
-                      delta: { type: "input_json_delta", partial_json: JSON.stringify(tu.input) }
-                    })}\n\n`
-                  ), "recover_tool_input")
+                  for (const chunk of chunkInputJson(JSON.stringify(tu.input))) {
+                    safeEnqueue(encoder.encode(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: blockIndex,
+                        delta: { type: "input_json_delta", partial_json: chunk }
+                      })}\n\n`
+                    ), "recover_tool_input")
+                  }
                   safeEnqueue(encoder.encode(
                     `event: content_block_stop\ndata: ${JSON.stringify({
                       type: "content_block_stop",
