@@ -62,6 +62,12 @@ const DEFAULT_FEATURES: AdapterFeatures = {
  * adapters with adapter-specific defaults appear here.
  */
 const ADAPTER_DEFAULTS: Record<string, Partial<AdapterFeatures>> = {
+  // OpenCode already supplies its own coding-agent system prompt and tool
+  // instructions. Stacking the Claude Code preset on top duplicates a large
+  // portion of the context on every request without improving tool routing.
+  opencode: {
+    codeSystemPrompt: false,
+  },
   // The `passthrough` adapter is the lightweight Anthropic-API-compatible
   // proxy mode. The Claude Code preset is ~28 KB of system prompt the
   // forwarded model doesn't need (and most pass-through clients don't want
