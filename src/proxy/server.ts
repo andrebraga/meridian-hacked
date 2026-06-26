@@ -37,7 +37,7 @@ import { exec as execCallback } from "child_process"
 import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
-import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, computeToolSetKey, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX } from "./passthroughTools"
+import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, computeToolSetKey, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, withoutNestedTaskToolForSubagent } from "./passthroughTools"
 import { resolveAgentAlias } from "./agentMatch"
 import { LRUMap } from "../utils/lruMap"
 
@@ -912,6 +912,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // previously sent them, reuse the cached set to preserve prompt cache.
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
       let requestTools = Array.isArray(body.tools) ? body.tools : []
+      // NOTE: agent-specific (opencode). A subagent does not need OpenCode's
+      // Task tool; registering it as a passthrough MCP tool embeds the large
+      // nested-agent schema into each Claude subagent cache write. Keep Task on
+      // primary requests so parent agents can still delegate normally.
+      if (adapter.name === "opencode" && agentMode === "subagent" && requestTools.length > 0) {
+        requestTools = withoutNestedTaskToolForSubagent(requestTools, true)
+      }
       // Extract advisor model from tools and strip advisor tool definitions
       // before passing to passthrough MCP — the SDK handles advisors natively
       // via the advisorModel query option.

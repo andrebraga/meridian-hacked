@@ -62,6 +62,25 @@ describe("OpenCode transform parity", () => {
     expect(ctx.sdkAgents).toEqual(openCodeAdapter.buildSdkAgents!(body, openCodeAdapter.getAllowedMcpTools()))
   })
 
+  it("does not build nested SDK agents for OpenCode subagents", () => {
+    const body = {
+      tools: [{
+        name: "task",
+        description: "Available agent types: explore, general",
+        input_schema: { type: "object", properties: {} },
+      }],
+    }
+    const ctx = runTransformHook(
+      openCodeTransforms,
+      "onRequest",
+      { ...makeCtx("opencode", body), headers: new Headers({ "x-opencode-agent-mode": "subagent" }) },
+      "opencode",
+    )
+    expect(ctx.sdkAgents).toEqual({})
+    expect(ctx.sdkHooks).toBeUndefined()
+    expect(ctx.systemContext).toBeUndefined()
+  })
+
   it("matches buildSystemContextAddendum with no agents", () => {
     const body = { tools: [] }
     const ctx = runTransformHook(

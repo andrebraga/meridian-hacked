@@ -22,9 +22,15 @@ export const openCodeTransforms: Transform[] = [
       const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
       const passthrough = !(envVal === "0" || envVal === "false" || envVal === "no")
 
+      // NOTE: OpenCode-specific. Subagents should not receive nested Task agent
+      // definitions. They cannot safely spawn their own subagents in OpenCode's
+      // permission model, and those definitions become large Claude cache-write
+      // payloads for every parallel subagent session.
+      const isSubagent = ctx.headers.get("x-opencode-agent-mode") === "subagent"
+
       // SDK agents (parse Task tool description)
       let sdkAgents: Record<string, any> = {}
-      if (Array.isArray(body.tools)) {
+      if (!isSubagent && Array.isArray(body.tools)) {
         const taskTool = body.tools.find((t: any) => t.name === "task" || t.name === "Task")
         if (taskTool) {
           sdkAgents = buildAgentDefinitionsFromTool(taskTool, [...allowedMcpTools])

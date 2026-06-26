@@ -15,6 +15,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { assistantMessage } from "./helpers"
 
 let mockMessages: unknown[] = []
@@ -41,7 +44,13 @@ mock.module("../mcpTools", () => ({
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { setSessionStoreDir } = await import("../proxy/sessionStore")
 const { lookupSession } = await import("../proxy/session/cache")
+
+let tmpDir: string
+
+const FINGERPRINT_CWD =
+  process.env.MERIDIAN_WORKDIR ?? process.env.CLAUDE_PROXY_WORKDIR ?? process.cwd()
 
 function createTestApp() {
   const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
@@ -60,18 +69,23 @@ const BASE_BODY = {
   model: "claude-sonnet-4-5",
   max_tokens: 1024,
   stream: false,
+  system: `<env>\n  Working directory: ${FINGERPRINT_CWD}\n</env>`,
   messages: [{ role: "user", content: "hello from pylon main" }],
 }
 
 describe("x-meridian-source: fingerprint cache skip for independent sessions", () => {
   beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "source-skip-cache-"))
+    setSessionStoreDir(tmpDir)
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedQueryParams = null
     clearSessionCache()
   })
 
   afterEach(() => {
+    setSessionStoreDir(null)
     clearSessionCache()
+    try { rmSync(tmpDir, { recursive: true, force: true }) } catch {}
   })
 
   /**
@@ -93,7 +107,7 @@ describe("x-meridian-source: fingerprint cache skip for independent sessions", (
 
   it("does NOT write to the fingerprint cache when source=fork-memory-extract", async () => {
     const app = createTestApp()
-    const cwd = process.cwd()
+    const cwd = FINGERPRINT_CWD
 
     await post(app, BASE_BODY, { "x-meridian-source": "fork-memory-extract" })
 
@@ -103,7 +117,7 @@ describe("x-meridian-source: fingerprint cache skip for independent sessions", (
 
   it("does NOT write to the fingerprint cache when source=subagent-<name>", async () => {
     const app = createTestApp()
-    const cwd = process.cwd()
+    const cwd = FINGERPRINT_CWD
     await post(app, BASE_BODY, { "x-meridian-source": "subagent-scout" })
 
     const result = lookupSession(undefined, nextTurn, cwd)
@@ -114,7 +128,7 @@ describe("x-meridian-source: fingerprint cache skip for independent sessions", (
     // Sanity: main requests (non-fork, non-subagent) must still populate the
     // cache so the normal resume optimization works for regular chat turns.
     const app = createTestApp()
-    const cwd = process.cwd()
+    const cwd = FINGERPRINT_CWD
 
     await post(app, BASE_BODY, { "x-meridian-source": "main" })
 
@@ -126,7 +140,7 @@ describe("x-meridian-source: fingerprint cache skip for independent sessions", (
     // Backward-compat: clients that don't send x-meridian-source must get
     // today's behavior byte-for-byte.
     const app = createTestApp()
-    const cwd = process.cwd()
+    const cwd = FINGERPRINT_CWD
     await post(app, BASE_BODY)
 
     const result = lookupSession(undefined, nextTurn, cwd)
@@ -139,7 +153,7 @@ describe("x-meridian-source: fingerprint cache skip for independent sessions", (
     // exactly why we needed this fix). The fork must not overwrite or
     // invalidate the parent's cache.
     const app = createTestApp()
-    const cwd = process.cwd()
+    const cwd = FINGERPRINT_CWD
 
     // 1) Parent turn establishes cache.
     await post(app, BASE_BODY, { "x-meridian-source": "main" })

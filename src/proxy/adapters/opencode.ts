@@ -47,7 +47,7 @@ export const openCodeAdapter: AgentAdapter = {
 
   getCoreToolNames(): readonly string[] {
     // Tools Claude uses on nearly every turn — always loaded, never deferred.
-    return ["read", "write", "edit", "bash", "glob", "grep"]
+    return ["read", "write", "edit", "bash", "glob", "grep", "task"]
   },
 
   usesPassthrough(): boolean {
