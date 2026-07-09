@@ -1,6 +1,8 @@
 {
   "name": "@rynfar/meridian",
   "version": "1.45.0",
+  "name": "@oguzkaganozt/meridian",
+  "version": "1.44.0",
   "description": "Local Anthropic API powered by your Claude Max subscription. One subscription, every agent.",
   "type": "module",
   "main": "./dist/server.js",
@@ -77,13 +79,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rynfar/meridian.git"
+    "url": "git+https://github.com/oguzkaganozt/meridian.git"
   },
-  "homepage": "https://github.com/rynfar/meridian#readme",
+  "homepage": "https://github.com/oguzkaganozt/meridian#readme",
   "bugs": {
-    "url": "https://github.com/rynfar/meridian/issues"
+    "url": "https://github.com/oguzkaganozt/meridian/issues"
   },
-  "author": "rynfar",
+  "author": "oguzkaganozt",
   "license": "MIT",
   "private": false,
   "packageManager": "bun@1.3.11"

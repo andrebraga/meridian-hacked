@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { computeToolSetKey } from "../proxy/passthroughTools"
+import { computeToolSetKey, withoutNestedTaskToolForSubagent } from "../proxy/passthroughTools"
 
 describe("computeToolSetKey", () => {
   it("is stable across input ordering", () => {
@@ -52,5 +52,13 @@ describe("computeToolSetKey", () => {
     const a = computeToolSetKey([{ name: "read" }])
     const b = computeToolSetKey([{ name: "read", input_schema: null as any }])
     expect(a).toBe(b)
+  })
+})
+
+describe("withoutNestedTaskToolForSubagent", () => {
+  it("removes Task only for OpenCode subagents", () => {
+    const tools = [{ name: "read" }, { name: "Task" }, { name: "grep" }]
+    expect(withoutNestedTaskToolForSubagent(tools, true).map(t => t.name)).toEqual(["read", "grep"])
+    expect(withoutNestedTaskToolForSubagent(tools, false).map(t => t.name)).toEqual(["read", "Task", "grep"])
   })
 })

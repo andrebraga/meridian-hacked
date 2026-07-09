@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  getFeaturesForAdapter,
   validateFeatureUpdate,
   type AdapterFeatures,
 } from "../proxy/sdkFeatures"
@@ -91,6 +92,18 @@ describe("validateFeatureUpdate", () => {
 
   it("returns empty object for empty input", () => {
     expect(validateFeatureUpdate({})).toEqual({})
+  })
+})
+
+// ── Adapter defaults ─────────────────────────────────────────────────
+
+describe("sdkFeatures adapter defaults", () => {
+  it("keeps OpenCode's client prompt but does not stack the Claude Code preset", () => {
+    const features = getFeaturesForAdapter("opencode")
+
+    expect(features.codeSystemPrompt).toBe(false)
+    expect(features.clientSystemPrompt).toBe(true)
+    expect(features.claudeMd).toBe("off")
   })
 })
 

@@ -9,10 +9,12 @@
 import { describe, it, expect, mock, beforeEach } from "bun:test"
 
 let capturedModel: string | null = null
+let capturedAgents: Record<string, unknown> | undefined
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   query: (opts: any) => {
     capturedModel = opts.options?.model ?? null
+    capturedAgents = opts.options?.agents
     return (async function* () {
       yield {
         type: "assistant",
@@ -93,6 +95,7 @@ describe("Subagent model selection", () => {
   beforeEach(() => {
     clearSessionCache()
     capturedModel = null
+    capturedAgents = undefined
   })
 
   it("primary agent gets sonnet (200k) for max subscription", async () => {
@@ -139,5 +142,17 @@ describe("Subagent model selection", () => {
     expect(proxyLog).toBeDefined()
     expect(proxyLog).toContain("model=sonnet ")
     expect(proxyLog).toContain("agent=subagent")
+  })
+
+  it("subagent requests do not register nested SDK agents", async () => {
+    await post({
+      ...BASE_REQUEST,
+      tools: [
+        { name: "read", description: "Read files", input_schema: { type: "object", properties: {} } },
+        { name: "task", description: "Launch subagent", input_schema: { type: "object", properties: {} } },
+      ],
+    }, { "x-opencode-agent-mode": "subagent" })
+
+    expect(capturedAgents).toBeUndefined()
   })
 })

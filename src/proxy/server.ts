@@ -39,6 +39,8 @@ import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX } from "./passthroughTools"
+
+import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, computeToolSetKey, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, withoutNestedTaskToolForSubagent } from "./passthroughTools"
 import { resolveAgentAlias } from "./agentMatch"
 import { LRUMap } from "../utils/lruMap"
 
@@ -102,6 +104,59 @@ let claudeExecutable = ""
 // "feels dead" threshold. Pylon's turn watchdog (120s warn / 180s abort) is the
 // looser backstop, so this fires first.
 const UPSTREAM_IDLE_MS = 90_000
+
+/**
+ * Maximum bytes per `input_json_delta` chunk emitted in passthrough mode.
+ *
+ * Anthropic's reference streaming clients emit deltas in the ~1-2 KB range,
+ * and several downstream parsers (including some SSE middleboxes) truncate
+ * or coalesce frames that exceed their line buffer. The Anthropic spec
+ * permits any chunk size — partial_json values are concatenated by the
+ * client — so we chunk defensively to stay well under common buffer limits
+ * while not fragmenting tiny inputs unnecessarily.
+ *
+ * Set to 0 to disable chunking (emit the whole input as one delta, the
+ * pre-fix behaviour).
+ */
+const PASSTHROUGH_INPUT_DELTA_MAX_BYTES = (() => {
+  const raw = process.env.MERIDIAN_PASSTHROUGH_INPUT_DELTA_MAX_BYTES
+  const parsed = raw === undefined ? 1024 : Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1024
+})()
+
+/**
+ * Split a serialized JSON string into chunks for SSE `input_json_delta`
+ * emission. Tries not to split mid-token (between structural characters) so
+ * the concatenated result is byte-identical to the input.
+ */
+function chunkInputJson(serialized: string): string[] {
+  if (PASSTHROUGH_INPUT_DELTA_MAX_BYTES <= 0) return [serialized]
+  if (serialized.length <= PASSTHROUGH_INPUT_DELTA_MAX_BYTES) return [serialized]
+
+  const chunks: string[] = []
+  let i = 0
+  const max = PASSTHROUGH_INPUT_DELTA_MAX_BYTES
+  while (i < serialized.length) {
+    let end = Math.min(i + max, serialized.length)
+    // Prefer to break on a structural boundary (",", ":", "}", "]", "{", "[")
+    // within the last 32 chars so we don't split inside a string literal.
+    if (end < serialized.length) {
+      const lookback = Math.min(32, end - i)
+      let boundary = -1
+      for (let j = end; j > end - lookback; j--) {
+        const c = serialized[j - 1]
+        if (c === "," || c === ":" || c === "}" || c === "]" || c === "{" || c === "[") {
+          boundary = j
+          break
+        }
+      }
+      if (boundary > i) end = boundary
+    }
+    chunks.push(serialized.slice(i, end))
+    i = end
+  }
+  return chunks
+}
 
 function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | undefined {
   if (profile.type !== "claude-max") return undefined
@@ -922,6 +977,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // previously sent them, reuse the cached set to preserve prompt cache.
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
       let requestTools = Array.isArray(body.tools) ? body.tools : []
+      // NOTE: agent-specific (opencode). A subagent does not need OpenCode's
+      // Task tool; registering it as a passthrough MCP tool embeds the large
+      // nested-agent schema into each Claude subagent cache write. Keep Task on
+      // primary requests so parent agents can still delegate normally.
+      if (adapter.name === "opencode" && agentMode === "subagent" && requestTools.length > 0) {
+        requestTools = withoutNestedTaskToolForSubagent(requestTools, true)
+      }
       // Extract advisor model from tools and strip advisor tool definitions
       // before passing to passthrough MCP — the SDK handles advisors natively
       // via the advisorModel query option.
@@ -1480,6 +1542,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             }
           }
 
+          // Deduplicate tool_use blocks by id (non-streaming path).
+          // The SDK can emit the same tool_use in multiple turns; without
+          // dedup the client sees duplicate blocks and executes the tool
+          // twice. Keep the first occurrence to preserve order. (#528)
+          if (passthrough) {
+            const seenToolUseIds = new Set<string>()
+            const dedupedBlocks: typeof contentBlocks = []
+            for (const block of contentBlocks) {
+              if (block.type === "tool_use") {
+                const id = (block as any).id as string | undefined
+                if (id && seenToolUseIds.has(id)) {
+                  claudeLog("passthrough.tool_use_deduped", { mode: "non_stream", id })
+                  continue
+                }
+                if (id) seenToolUseIds.add(id)
+              }
+              dedupedBlocks.push(block)
+            }
+            contentBlocks.length = 0
+            contentBlocks.push(...dedupedBlocks)
+          }
+
           // Determine stop_reason: use content-based heuristic for standard cases,
           // but preserve non-standard upstream values like pause_turn (advisor flows)
           const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
@@ -1655,6 +1739,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // dedupe captured tool_uses against what was already forwarded
             // when recovering gracefully from max_turns (see catch below).
             const streamedToolUseIds = new Set<string>()
+            // Hoisted so the max_turns recovery path in the catch block can
+            // emit synthetic tool_use blocks with consistent indices.
+            let nextClientBlockIndex = 0
 
             try {
               let currentSessionId: string | undefined
@@ -1830,8 +1917,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                     }
 
-                    throw error
-                  }
+                  throw error
+                }
                 }
               })()
 
@@ -1866,7 +1953,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // Block index remapping: the SDK resets indices on each turn, but
               // we skip intermediate message_start/stop so the client sees one
               // message. Without remapping, turn 2's index=0 collides with turn 1's.
-              let nextClientBlockIndex = 0
               const sdkToClientIndex = new Map<number, number>()
 
               const guardedResponse = guardUpstreamIdle(response, UPSTREAM_IDLE_MS, (sinceLastMs) =>
@@ -2131,11 +2217,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               if (!streamClosed) {
                 // In passthrough mode, emit captured tool_use blocks as stream events
                 // Skip any that were already forwarded during the stream (dedup by ID)
+                //
+                // NOTE: previously used `eventsForwarded + i` for the block index,
+                // but `eventsForwarded` counts ALL events (including deltas/stops/
+                // message_start/stop/ping), while `nextClientBlockIndex` counts only
+                // content blocks. For a response with 2 tool_uses and 2 deltas each
+                // the offset was off by ~10 — clients receiving index 10+ when they
+                // expected index 2+ would silently drop the synthetic blocks. Use
+                // the block counter so indices match what the SDK emitted upstream.
                 const unseenToolUses = capturedToolUses.filter(tu => !streamedToolUseIds.has(tu.id))
                 if (passthrough && unseenToolUses.length > 0 && messageStartEmitted) {
                   for (let i = 0; i < unseenToolUses.length; i++) {
                     const tu = unseenToolUses[i]!
-                    const blockIndex = eventsForwarded + i
+                    const blockIndex = nextClientBlockIndex++
 
                     // content_block_start
                     safeEnqueue(encoder.encode(
@@ -2146,14 +2240,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       })}\n\n`
                     ), "passthrough_tool_block_start")
 
-                    // input_json_delta with the full input
-                    safeEnqueue(encoder.encode(
-                      `event: content_block_delta\ndata: ${JSON.stringify({
-                        type: "content_block_delta",
-                        index: blockIndex,
-                        delta: { type: "input_json_delta", partial_json: JSON.stringify(tu.input) }
-                      })}\n\n`
-                    ), "passthrough_tool_input")
+                    // input_json_delta — chunked for clients with frame size limits
+                    for (const chunk of chunkInputJson(JSON.stringify(tu.input))) {
+                      safeEnqueue(encoder.encode(
+                        `event: content_block_delta\ndata: ${JSON.stringify({
+                          type: "content_block_delta",
+                          index: blockIndex,
+                          delta: { type: "input_json_delta", partial_json: chunk }
+                        })}\n\n`
+                      ), "passthrough_tool_input")
+                    }
 
                     // content_block_stop
                     safeEnqueue(encoder.encode(
@@ -2369,10 +2465,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Mirror the success-path emission: send any unseen tool_uses
                 // (dedup against streamedToolUseIds), then a clean
                 // message_delta with stop_reason="tool_use" + message_stop.
+                //
+                // Uses `nextClientBlockIndex` for the same reason as the
+                // success path above (eventsForwarded is not a block index).
                 const unseenToolUses = capturedToolUses.filter(tu => !streamedToolUseIds.has(tu.id))
                 for (let i = 0; i < unseenToolUses.length; i++) {
                   const tu = unseenToolUses[i]!
-                  const blockIndex = eventsForwarded + i
+                  const blockIndex = nextClientBlockIndex++
                   safeEnqueue(encoder.encode(
                     `event: content_block_start\ndata: ${JSON.stringify({
                       type: "content_block_start",
@@ -2380,13 +2479,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       content_block: { type: "tool_use", id: tu.id, name: tu.name, input: {} }
                     })}\n\n`
                   ), "recover_tool_block_start")
-                  safeEnqueue(encoder.encode(
-                    `event: content_block_delta\ndata: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: blockIndex,
-                      delta: { type: "input_json_delta", partial_json: JSON.stringify(tu.input) }
-                    })}\n\n`
-                  ), "recover_tool_input")
+                  for (const chunk of chunkInputJson(JSON.stringify(tu.input))) {
+                    safeEnqueue(encoder.encode(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: blockIndex,
+                        delta: { type: "input_json_delta", partial_json: chunk }
+                      })}\n\n`
+                    ), "recover_tool_input")
+                  }
                   safeEnqueue(encoder.encode(
                     `event: content_block_stop\ndata: ${JSON.stringify({
                       type: "content_block_stop",

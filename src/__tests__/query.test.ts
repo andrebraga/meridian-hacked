@@ -113,6 +113,50 @@ describe("buildQueryOptions", () => {
     expect(result.options.maxTurns).toBe(200)
   })
 
+  it("bumps maxTurns by 1 in passthrough mode when thinking is enabled", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, thinking: { type: "enabled", budgetTokens: 1024 } }))
+    expect(result.options.maxTurns).toBe(4)
+  })
+
+  it("does not bump maxTurns when thinking is disabled", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, thinking: { type: "disabled" } }))
+    expect(result.options.maxTurns).toBe(3)
+  })
+
+  it("does not bump maxTurns when thinking is adaptive", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, thinking: { type: "adaptive" } }))
+    expect(result.options.maxTurns).toBe(4)
+  })
+
+  it("respects MERIDIAN_PASSTHROUGH_MAX_TURNS env override", () => {
+    const prev = process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS
+    process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS = "10"
+    try {
+      const result = buildQueryOptions(makeContext({ passthrough: true }))
+      expect(result.options.maxTurns).toBe(10)
+    } finally {
+      if (prev === undefined) delete process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS
+      else process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS = prev
+    }
+  })
+
+  it("uses maxTurnsOverride when provided", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, maxTurnsOverride: 12 }))
+    expect(result.options.maxTurns).toBe(12)
+  })
+
+  it("maxTurnsOverride wins over env override", () => {
+    const prev = process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS
+    process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS = "10"
+    try {
+      const result = buildQueryOptions(makeContext({ passthrough: true, maxTurnsOverride: 12 }))
+      expect(result.options.maxTurns).toBe(12)
+    } finally {
+      if (prev === undefined) delete process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS
+      else process.env.MERIDIAN_PASSTHROUGH_MAX_TURNS = prev
+    }
+  })
+
   it("includes system prompt as preset in normal mode", () => {
     const result = buildQueryOptions(makeContext({ systemContext: "Be helpful" }))
     const sp = (result.options as any).systemPrompt

@@ -173,6 +173,14 @@ export function computeToolSetKey(
   return JSON.stringify(entries)
 }
 
+export function withoutNestedTaskToolForSubagent<T extends { name?: string }>(
+  tools: readonly T[],
+  isOpenCodeSubagent: boolean,
+): T[] {
+  if (!isOpenCodeSubagent) return [...tools]
+  return tools.filter((tool) => String(tool.name ?? "").toLowerCase() !== "task")
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
